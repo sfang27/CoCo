@@ -368,7 +368,7 @@ class FreeFlyer(Problem):
         for p in self.sampled_params:
             self.bin_prob_parameters[p].value = None
 
-        return prob_success, cost, solve_time, (x_star, u_star, y_star)
+        return prob_success, cost, solve_time, (x_star, u_star, y_star), solve_time_list
 
 
     def solve_pinned(self, params, strat, solver=cp.MOSEK):
@@ -394,6 +394,7 @@ class FreeFlyer(Problem):
         self.mlopt_prob.solve(solver=solver)
 
         solve_time = self.mlopt_prob.solver_stats.solve_time
+
         x_star, u_star, y_star = None, None, strat
         if self.mlopt_prob.status == 'optimal':
             prob_success = True
@@ -407,6 +408,104 @@ class FreeFlyer(Problem):
         self.mlopt_prob_parameters['y'].value = None
 
         return prob_success, cost, solve_time, (x_star, u_star, y_star)
+        
+    def solve_ccpinned(self, params, strat, solver=cp.MOSEK):
+        """High-level method to solve MICP with pinned params & integer values.
+        
+        Args:
+            params: Dict of param values; keys are self.sampled_params,
+                values are numpy arrays of specific param values.
+            strat: numpy integer array, corresponding to integer values for the
+                desired strategy.
+            solver: cvxpy Solver object; defaults to Mosek.
+        """
+        # set cvxpy params to their values
+        for p in self.sampled_params:
+            self.mlopt_prob_parameters[p].value = params[p]
+
+        self.mlopt_prob_parameters['y'].value = strat
+
+        solve_time_list = []
+
+        # initial even risk allocation - assuming no risk at t0
+        riskAlloc = [[self.Delta/((self.N-1) * self.n_obs) \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]
+        riskUsed =  [[0 \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]
+        riskActive =  [[0 \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]                        
+
+        ## TODO(pculbertson): allow different sets of params to vary.
+        # IRA loop
+        prevCost = np.Inf # initialise incumbent cost to be inf
+        while(sum(solve_time_list)< self.timeLimit):
+        
+            # convert risk allocation to margins
+            for i_t in range(self.N -1):
+                for i_obs in range:(self.n_obs):
+                    self.mlopt_margin_parameters[i_t,i_obs].value = \
+                        stats.norm.isf(riskAlloc[i_t][i_obs],0, self.iraSD[i_t+1])
+    
+            # solve problem with cvxpy
+            prob_success, cost, solve_time = False, np.Inf, np.Inf
+            self.mlopt_prob.solve(solver=solver)
+    
+            solve_time = self.mlopt_prob.solver_stats.solve_time
+            solve_time_list.append(solve_time)
+            x_star, u_star, y_star = None, None, strat
+            if self.mlopt_prob.status == 'optimal':
+                prob_success = True
+                cost = self.mlopt_prob.value
+                x_star = self.mlopt_prob_variables['x'].value
+                u_star = self.mlopt_prob_variables['u'].value
+                
+                # check for convergence and termination
+                if prevCost - cost < self.iraEps: 
+                    break
+                else:
+                    # no convergence, reallocate risk
+                    prevCost = cost
+                    # calculate risk used
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            # find max risk used
+                            currRiskUsed = 0
+                            for i_dim in range(self.n):
+                                yvar_min = 4*i_obs + self.n*i_dim
+                                yvar_max = 4*i_obs + self.n*i_dim + 1
+                                if y_star[yvar_min,i_t] ==0:
+                                    margin = o_min - x_star[i_dim,i_t+1] 
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t])) 
+                                if y_star[yvar_max,i_t] ==0:
+                                    margin = - o_max + x_star[i_dim,i_t+1] 
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
+                            riskUsed[i_t][i_obs] = currRiskUsed
+                    # work out difference between risk allocated and risk used, collect unused risk          
+                    riskResidual = 0
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            riskActive[i_t][i_obs] = (riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs] <= self.iraEqTol)
+                            if not(riskActive[i_t][i_obs]):
+                                riskResidual += (1-self.iraAlpha)*(riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs])
+                                riskAlloc[i_t][i_obs] = self.iraAlpha*riskAlloc + \
+                                                        (1-self.iraAlpha)*(riskUsed[i_t][i_obs])
+                    # redistribute collected risk
+                    riskRealloc = riskResidual/sum(riskActive)
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            if riskActive[i_t][i_obs]:
+                                riskAlloc[i_t][i_obs] = riskAlloc + riskRealloc
+
+            else:
+                break
+            
+        solve_time = sum(solve_time_list)
+        # Clear any saved params
+        for p in self.sampled_params:
+            self.mlopt_prob_parameters[p].value = None
+        self.mlopt_prob_parameters['y'].value = None
+
+        return prob_success, cost, solve_time, (x_star, u_star, y_star), solve_time_list
 
     def which_M(self, x, obstacles, eq_tol=1e-5, ineq_tol=1e-5):
         """Method to check which big-M constraints are active.
