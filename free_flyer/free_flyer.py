@@ -6,6 +6,8 @@ import numpy as np
 import sys
 import pdb
 
+import scipy.stats as stats # for cdf calculations
+
 sys.path.insert(1, os.environ['MLOPT'])
 
 from core import Problem
@@ -44,7 +46,23 @@ class FreeFlyer(Problem):
         self.W = int(self.posmax[0] / self.posmax[1] * self.H)
         self.H, self.W = 32, 32
 
-        self.init_bin_problem()
+        # mod for IRA - assuming actuation risk is normal, and iid in each dimension
+        self.Delta = 0.1 # risk bounds TODO: maybe train on this param too?
+        self.dt = 1 # time step size
+        self.actSD = 0.01 # variance of actuation noise
+        self.initSD = 0.00
+        
+        # risk allocation params
+        self.iraEps = 1e-4 # termination for risk reallocation
+        self.iraAlpha = 0.5 # proportion of unused risk to redistribute
+        self.iraEqTol = 1e-5 # tolerance for equality
+        # calculate standard deviations ahead of time 
+        self.iraSD = sqrt([self.initSD**2+(ii*dt)*actSD**2 for ii in range(self.N)])
+        
+        # time limit for risk allocation
+        self.timeLimit = 1e3
+
+        self.init_bin_problem() 
         self.init_mlopt_problem()
 
     def init_bin_problem(self):
@@ -61,7 +79,15 @@ class FreeFlyer(Problem):
         xg = cp.Parameter(2*self.n)
         obstacles = cp.Parameter((4, self.n_obs))
         self.bin_prob_parameters = {'x0': x0, 'xg': xg, 'obstacles': obstacles} 
-
+        
+        # chance constraint safety margins N steps, n_obs obstacles
+        # using parameters so we can perform IRA with the same problem instance
+        # Initialise with 0 for each value, equivalent to deterministic planning 
+        # assume like they do that there's no risk at t0
+        self.bin_margin_parameters = cp.Parameter((self.N-1,self.n_obs))
+        for d in self.bin_margin_parameters:
+            d.value = 0
+        
         cons += [x[:,0] == x0]
 
         # Dynamics constraints
@@ -77,10 +103,12 @@ class FreeFlyer(Problem):
             for i_t in range(self.N-1):
               yvar_min = 4*i_obs + self.n*i_dim
               yvar_max = 4*i_obs + self.n*i_dim + 1
-
-              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t]]
-              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t]]
-
+              # adding safety margin
+#              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t]]
+#              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t]]
+              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t] - self.bin_margin_parameters[i_t,i_obs]]
+              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t] - self.bin_margin_parameters[i_t,i_obs]]
+              
           for i_t in range(self.N-1):
             yvar_min, yvar_max = 4*i_obs, 4*(i_obs+1)
             cons += [sum([y[ii,i_t] for ii in range(yvar_min,yvar_max)]) <= 3]
@@ -126,6 +154,14 @@ class FreeFlyer(Problem):
         y = cp.Parameter((4*self.n_obs,self.N-1)) 
         self.mlopt_prob_parameters = {'x0': x0, 'xg': xg,
           'obstacles': obstacles, 'y':y}
+          
+        # chance constraint safety margins N steps, n_obs obstacles
+        # using parameters so we can perform IRA with the same problem instance
+        # Initialise with 0 for each value, equivalent to deterministic planning 
+        # This uses their assumption that there is no risk at t0
+        self.mlopt_margin_parameters = cp.Parameter((self.N-1,self.n_obs))
+        for d in self.mlopt_margin_parameters:
+            d.value = 0
 
         cons += [x[:,0] == x0]
 
@@ -143,8 +179,10 @@ class FreeFlyer(Problem):
               yvar_min = 4*i_obs + self.n*i_dim
               yvar_max = 4*i_obs + self.n*i_dim + 1
 
-              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t]]
-              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t]]
+#              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t]]
+#              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t]]
+              cons += [x[i_dim,i_t+1] <= o_min + M*y[yvar_min,i_t]-self.mlopt_margin_parameters[i_t,i_obs]]
+              cons += [-x[i_dim,i_t+1] <= -o_max + M*y[yvar_max,i_t]-self.mlopt_margin_parameters[i_t,i_obs]]
 
           for i_t in range(self.N-1):
             yvar_min, yvar_max = 4*i_obs, 4*(i_obs+1)
@@ -221,6 +259,117 @@ class FreeFlyer(Problem):
             self.bin_prob_parameters[p].value = None
 
         return prob_success, cost, solve_time, (x_star, u_star, y_star)
+
+    def solve_ccmicp(self, params, solver=cp.MOSEK):
+        """High-level method to solve parameterized cc-MICP.
+        
+        Args:
+            params: Dict of param values; keys are self.sampled_params,
+                values are numpy arrays of specific param values.
+            solver: cvxpy Solver object; defaults to Mosek.
+        """
+        # set cvxpy parameters to their values
+        for p in self.sampled_params:
+            self.bin_prob_parameters[p].value = params[p]
+
+        ## TODO(pculbertson): allow different sets of params to vary.
+        
+        # solve problem with cvxpy
+        prob_success, cost, solve_time = False, np.Inf, np.Inf
+        solve_time_list = []
+
+        # initial even risk allocation - assuming no risk at t0
+        riskAlloc = [[self.Delta/((self.N-1) * self.n_obs) \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]
+        riskUsed =  [[0 \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]
+        riskActive =  [[0 \
+                        for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]                        
+        
+        
+        # IRA loop
+        prevCost = np.Inf # initialise incumbent cost to be inf
+        while(sum(solve_time_list)< self.timeLimit):
+        
+            # convert risk allocation to margins
+            for i_t in range(self.N -1):
+                for i_obs in range:(self.n_obs):
+                    self.bin_margin_parameters[i_t,i_obs].value = \
+                        stats.norm.isf(riskAlloc[i_t][i_obs],0, self.iraSD[i_t+1])
+            
+            if solver == cp.MOSEK:
+                # See: https://docs.mosek.com/9.1/dotnetfusion/param-groups.html#doc-param-groups
+                msk_param_dict = {}
+                with open(os.path.join(os.environ['MLOPT'], 'config/mosek.yaml')) as file:
+                    msk_param_dict = yaml.load(file, Loader=yaml.FullLoader)
+    
+                self.bin_prob.solve(solver=solver, mosek_params=msk_param_dict)
+            elif solver == cp.GUROBI:
+                grb_param_dict = {}
+                with open(os.path.join(os.environ['MLOPT'], 'config/gurobi.yaml')) as file:
+                    grb_param_dict = yaml.load(file, Loader=yaml.FullLoader)
+    
+                self.bin_prob.solve(solver=solver, **grb_param_dict)
+            solve_time = self.bin_prob.solver_stats.solve_time
+            solve_time_list.append(solve_time)
+
+
+            x_star, u_star, y_star = None, None, None
+            if self.bin_prob.status == 'optimal' or self.bin_prob.status == 'optimal_inaccurate':
+                prob_success = True
+                cost = self.bin_prob.value
+                x_star = self.bin_prob_variables['x'].value
+                u_star = self.bin_prob_variables['u'].value
+                y_star = self.bin_prob_variables['y'].value.astype(int)
+                
+                # check for convergence and termination
+                if prevCost - cost < self.iraEps: 
+                    break
+                else:
+                    # no convergence, reallocate risk
+                    prevCost = cost
+                    # calculate risk used
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            # find max risk used
+                            currRiskUsed = 0
+                            for i_dim in range(self.n):
+                                yvar_min = 4*i_obs + self.n*i_dim
+                                yvar_max = 4*i_obs + self.n*i_dim + 1
+                                if y_star[yvar_min,i_t] ==0:
+                                    margin = o_min - x_star[i_dim,i_t+1] 
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t])) 
+                                if y_star[yvar_max,i_t] ==0:
+                                    margin = - o_max + x_star[i_dim,i_t+1] 
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
+                            riskUsed[i_t][i_obs] = currRiskUsed
+                    # work out difference between risk allocated and risk used, collect unused risk          
+                    riskResidual = 0
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            riskActive[i_t][i_obs] = (riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs] <= self.iraEqTol)
+                            if not(riskActive[i_t][i_obs]):
+                                riskResidual += (1-self.iraAlpha)*(riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs])
+                                riskAlloc[i_t][i_obs] = self.iraAlpha*riskAlloc + \
+                                                        (1-self.iraAlpha)*(riskUsed[i_t][i_obs])
+                    # redistribute collected risk
+                    riskRealloc = riskResidual/sum(riskActive)
+                    for i_t in range(self.N-1):
+                        for i_obs in range(self.n_obs):
+                            if riskActive[i_t][i_obs]:
+                                riskAlloc[i_t][i_obs] = riskAlloc + riskRealloc
+                                                    
+            else:
+                break
+
+        solve_time = sum(solve_time_list)
+        
+        # Clear any saved params
+        for p in self.sampled_params:
+            self.bin_prob_parameters[p].value = None
+
+        return prob_success, cost, solve_time, (x_star, u_star, y_star)
+
 
     def solve_pinned(self, params, strat, solver=cp.MOSEK):
         """High-level method to solve MICP with pinned params & integer values.
