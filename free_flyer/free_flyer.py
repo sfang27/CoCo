@@ -6,6 +6,9 @@ import numpy as np
 import sys
 import pdb
 
+from numpy import sqrt
+import numpy as np
+
 import scipy.stats as stats # for cdf calculations
 
 sys.path.insert(1, os.environ['MLOPT'])
@@ -57,7 +60,7 @@ class FreeFlyer(Problem):
         self.iraAlpha = 0.5 # proportion of unused risk to redistribute
         self.iraEqTol = 1e-5 # tolerance for equality
         # calculate standard deviations ahead of time 
-        self.iraSD = sqrt([self.initSD**2+(ii*dt)*actSD**2 for ii in range(self.N)])
+        self.iraSD = sqrt([self.initSD**2+(ii*self.dt)*self.actSD**2 for ii in range(self.N)])
         
         # time limit for risk allocation
         self.timeLimit = 1e3
@@ -85,8 +88,6 @@ class FreeFlyer(Problem):
         # Initialise with 0 for each value, equivalent to deterministic planning 
         # assume like they do that there's no risk at t0
         self.bin_margin_parameters = cp.Parameter((self.N-1,self.n_obs))
-        for d in self.bin_margin_parameters:
-            d.value = 0
         
         cons += [x[:,0] == x0]
 
@@ -160,8 +161,6 @@ class FreeFlyer(Problem):
         # Initialise with 0 for each value, equivalent to deterministic planning 
         # This uses their assumption that there is no risk at t0
         self.mlopt_margin_parameters = cp.Parameter((self.N-1,self.n_obs))
-        for d in self.mlopt_margin_parameters:
-            d.value = 0
 
         cons += [x[:,0] == x0]
 
@@ -292,10 +291,11 @@ class FreeFlyer(Problem):
         while(sum(solve_time_list)< self.timeLimit):
         
             # convert risk allocation to margins
-            for i_t in range(self.N -1):
-                for i_obs in range:(self.n_obs):
-                    self.bin_margin_parameters[i_t,i_obs].value = \
-                        stats.norm.isf(riskAlloc[i_t][i_obs],0, self.iraSD[i_t+1])
+            margins = np.zeros((self.N - 1, self.n_obs))
+            for i_t in range(self.N - 1):
+                for i_obs in range(self.n_obs):
+                    margins[i_t, i_obs] = stats.norm.isf(riskAlloc[i_t][i_obs],0, self.iraSD[i_t+1])
+            self.bin_margin_parameters.value = margins
             
             if solver == cp.MOSEK:
                 # See: https://docs.mosek.com/9.1/dotnetfusion/param-groups.html#doc-param-groups
@@ -442,7 +442,7 @@ class FreeFlyer(Problem):
         
             # convert risk allocation to margins
             for i_t in range(self.N -1):
-                for i_obs in range:(self.n_obs):
+                for i_obs in range(self.n_obs):
                     self.mlopt_margin_parameters[i_t,i_obs].value = \
                         stats.norm.isf(riskAlloc[i_t][i_obs],0, self.iraSD[i_t+1])
     
