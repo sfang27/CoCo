@@ -270,12 +270,12 @@ class FreeFlyer(Problem):
         # set cvxpy parameters to their values
         for p in self.sampled_params:
             self.bin_prob_parameters[p].value = params[p]
-
+        obstacles = self.bin_prob_parameters['obstacles']
         ## TODO(pculbertson): allow different sets of params to vary.
         
         # solve problem with cvxpy
         prob_success, cost, solve_time = False, np.Inf, np.Inf
-        solve_time_list = []
+        solve_time = 0
 
         # initial even risk allocation - assuming no risk at t0
         riskAlloc = [[self.Delta/((self.N-1) * self.n_obs) \
@@ -285,10 +285,9 @@ class FreeFlyer(Problem):
         riskActive =  [[0 \
                         for i_obs in range(self.n_obs)] for i_t in range(self.N-1)]                        
         
-        
         # IRA loop
         prevCost = np.Inf # initialise incumbent cost to be inf
-        while(sum(solve_time_list)< self.timeLimit):
+        while(solve_time < self.timeLimit):
         
             # convert risk allocation to margins
             margins = np.zeros((self.N - 1, self.n_obs))
@@ -310,8 +309,8 @@ class FreeFlyer(Problem):
                     grb_param_dict = yaml.load(file, Loader=yaml.FullLoader)
     
                 self.bin_prob.solve(solver=solver, **grb_param_dict)
-            solve_time = self.bin_prob.solver_stats.solve_time
-            solve_time_list.append(solve_time)
+            if self.bin_prob.solver_stats.solve_time is not None:
+                solve_time += self.bin_prob.solver_stats.solve_time
 
 
             x_star, u_star, y_star = None, None, None
@@ -334,41 +333,44 @@ class FreeFlyer(Problem):
                             # find max risk used
                             currRiskUsed = 0
                             for i_dim in range(self.n):
+                                o_min = obstacles[self.n * i_dim, i_obs].value
+                                o_max = obstacles[self.n * i_dim + 1, i_obs].value
                                 yvar_min = 4*i_obs + self.n*i_dim
                                 yvar_max = 4*i_obs + self.n*i_dim + 1
                                 if y_star[yvar_min,i_t] ==0:
-                                    margin = o_min - x_star[i_dim,i_t+1] 
-                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t])) 
+                                    margin = o_min - x_star[i_dim,i_t+1]
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
                                 if y_star[yvar_max,i_t] ==0:
-                                    margin = - o_max + x_star[i_dim,i_t+1] 
+                                    margin = - o_max + x_star[i_dim,i_t+1]
                                     currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
                             riskUsed[i_t][i_obs] = currRiskUsed
                     # work out difference between risk allocated and risk used, collect unused risk          
                     riskResidual = 0
+                    act_num = 0
                     for i_t in range(self.N-1):
                         for i_obs in range(self.n_obs):
                             riskActive[i_t][i_obs] = (riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs] <= self.iraEqTol)
                             if not(riskActive[i_t][i_obs]):
                                 riskResidual += (1-self.iraAlpha)*(riskAlloc[i_t][i_obs]-riskUsed[i_t][i_obs])
-                                riskAlloc[i_t][i_obs] = self.iraAlpha*riskAlloc + \
+                                riskAlloc[i_t][i_obs] = self.iraAlpha*riskAlloc[i_t][i_obs] + \
                                                         (1-self.iraAlpha)*(riskUsed[i_t][i_obs])
+                            else: act_num += 1
                     # redistribute collected risk
-                    riskRealloc = riskResidual/sum(riskActive)
+                    if act_num == 0: break
+                    riskRealloc = riskResidual/ act_num
                     for i_t in range(self.N-1):
                         for i_obs in range(self.n_obs):
                             if riskActive[i_t][i_obs]:
-                                riskAlloc[i_t][i_obs] = riskAlloc + riskRealloc
+                                riskAlloc[i_t][i_obs] = riskAlloc[i_t][i_obs] + riskRealloc
                                                     
             else:
                 break
 
-        solve_time = sum(solve_time_list)
-        
         # Clear any saved params
         for p in self.sampled_params:
             self.bin_prob_parameters[p].value = None
 
-        return prob_success, cost, solve_time, (x_star, u_star, y_star), solve_time_list
+        return prob_success, cost, solve_time, (x_star, u_star, y_star)
 
 
     def solve_pinned(self, params, strat, solver=cp.MOSEK):
@@ -420,6 +422,9 @@ class FreeFlyer(Problem):
             solver: cvxpy Solver object; defaults to Mosek.
         """
         # set cvxpy params to their values
+
+        obstacles = self.mlopt_prob_parameters['obstacles']
+
         for p in self.sampled_params:
             self.mlopt_prob_parameters[p].value = params[p]
 
@@ -468,14 +473,16 @@ class FreeFlyer(Problem):
                     # calculate risk used
                     for i_t in range(self.N-1):
                         for i_obs in range(self.n_obs):
+                            o_min = obstacles[self.n * i_dim, i_obs].value
+                            o_max = obstacles[self.n * i_dim + 1, i_obs].value
                             # find max risk used
                             currRiskUsed = 0
                             for i_dim in range(self.n):
                                 yvar_min = 4*i_obs + self.n*i_dim
                                 yvar_max = 4*i_obs + self.n*i_dim + 1
                                 if y_star[yvar_min,i_t] ==0:
-                                    margin = o_min - x_star[i_dim,i_t+1] 
-                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t])) 
+                                    margin = o_min - x_star[i_dim,i_t+1]
+                                    currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
                                 if y_star[yvar_max,i_t] ==0:
                                     margin = - o_max + x_star[i_dim,i_t+1] 
                                     currRiskUsed = max(currRiskUsed, stats.norm.sf(margin,0,self.iraSD[i_t]))
